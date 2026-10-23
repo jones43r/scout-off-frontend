@@ -8,10 +8,10 @@ import { getExplorerAccountUrl } from '@/lib/network';
 
 interface PlayerProfileLayoutProps {
   children: ReactNode;
-  params: {
+  params: Promise<{
     locale: string;
     id: string;
-  };
+  }>;
 }
 
 /**
@@ -21,10 +21,13 @@ interface PlayerProfileLayoutProps {
  * <script type="application/ld+json"> tag so search engines can
  * understand the page as representing a person/athlete.
  */
-export default async function PlayerProfileLayout({
-  children,
-  params,
-}: PlayerProfileLayoutProps) {
+export default async function PlayerProfileLayout(
+  props: PlayerProfileLayoutProps,
+) {
+  const params = await props.params;
+
+  const { children } = props;
+
   let player: Player | null = null;
 
   try {
@@ -80,9 +83,10 @@ export default async function PlayerProfileLayout({
  * The parent `app/[locale]/layout.tsx` already provides a canonical URL
  * via `seoMetadata()`, so we don't need to duplicate it here.
  */
-export async function generateMetadata({
-  params,
-}: PlayerProfileLayoutProps): Promise<Metadata> {
+export async function generateMetadata(
+  props: PlayerProfileLayoutProps,
+): Promise<Metadata> {
+  const params = await props.params;
   let player: Player | null = null;
 
   try {

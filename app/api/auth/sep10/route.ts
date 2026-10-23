@@ -1,4 +1,9 @@
-import { WebAuth, Keypair, StrKey } from '@stellar/stellar-sdk';
+import {
+  WebAuth,
+  Keypair,
+  StrKey,
+  TransactionBuilder,
+} from '@stellar/stellar-sdk';
 import { NextRequest, NextResponse } from 'next/server';
 import { apiError, ApiErrorCode } from '@/lib/apiErrors';
 import { randomUUID } from 'crypto';
@@ -17,12 +22,15 @@ import {
   setSessionCookies,
 } from '@/lib/sessionCookies';
 import { SessionStore } from '@/lib/sessionStore';
+import { Sep10NonceStore } from '@/lib/sep10NonceStore';
 import { withRouteTelemetry } from '@/lib/telemetry';
 import { getNetworkPassphrase } from '@/lib/network';
 
 // better-sqlite3 (via lib/sessionStore.ts) is a native addon and needs the
 // Node.js runtime, not edge.
 export const runtime = 'nodejs';
+
+const CHALLENGE_TIMEOUT_SEC = 300;
 
 // Same check as lib/stellar's isValidStellarAddress, without importing that
 // module's RPC client into the auth route. Only G-addresses pass; muxed
@@ -133,6 +141,40 @@ async function postSep10(req: NextRequest) {
       homeDomain,
     );
 
+    // Replay protection (#1488): a signed XDR is valid for 300 s. Without
+    // this check, anyone holding a copy of the signed XDR (proxy log,
+    // browser extension, intercepted request) could re-POST it within that
+    // window and obtain independent sessions.
+    //
+    // Strategy: after the signature check passes, parse the XDR to read the
+    // challenge's own maxTime, then atomically mark the XDR hash as consumed
+    // in the nonce store. If the hash is already present, reject immediately
+    // — the nonce was already used to mint a session.
+    //
+    // We parse the XDR here (rather than in getSep10) because at this point
+    // we know the XDR is well-formed (verifyChallengeTxSigners would have
+    // thrown otherwise), so the parse is guaranteed to succeed and we avoid
+    // parsing the same XDR twice on the happy path.
+    const parsedTx = TransactionBuilder.fromXDR(signedXdr, network) as {
+      timeBounds?: { maxTime: string };
+    };
+    const maxTimeSec = parsedTx.timeBounds
+      ? parseInt(parsedTx.timeBounds.maxTime, 10)
+      : Math.floor(Date.now() / 1000) + 300; // defensive fallback
+
+    const xdrHash = Sep10NonceStore.hashXdr(signedXdr);
+    const firstUse = Sep10NonceStore.getInstance().consumeNonce(
+      xdrHash,
+      maxTimeSec,
+    );
+    if (!firstUse) {
+      log.error('SEP-10 replay attempt detected', { xdrHash });
+      return withRequestId(
+        apiError(ApiErrorCode.INVALID_SIGNATURE, 401, 'Verification failed'),
+        log.requestId,
+      );
+    }
+
     // `maxAge` in the response reflects the refresh token's lifetime — the
     // window before a caller must produce a brand-new signed SEP-10
     // challenge rather than just calling /api/auth/refresh — preserving the
@@ -168,6 +210,18 @@ async function postSep10(req: NextRequest) {
       Date.now() + maxAge * 1000,
       req.headers.get('user-agent'),
     );
+
+    // Opportunistically evict expired nonces. This runs after the session is
+    // already committed so it's on the non-critical path — a failure here
+    // would not affect the response. In practice the table is tiny (one row
+    // per challenge consumed; rows expire with the 300 s challenge window),
+    // so sweeping synchronously is negligible.
+    try {
+      Sep10NonceStore.getInstance().sweepExpired();
+    } catch {
+      // Best-effort; a sweep failure must not abort an otherwise-successful
+      // login.
+    }
 
     const response = NextResponse.json({ success: true, maxAge });
     setSessionCookies(response, {
@@ -210,14 +264,12 @@ async function getSep10(req: NextRequest) {
   const network = getNetworkPassphrase();
 
   try {
-    const { Keypair } = await import('@stellar/stellar-sdk');
     const serverKeypair = Keypair.fromSecret(serverKey);
-    const { buildChallengeTx } = (await import('@stellar/stellar-sdk')).WebAuth;
-    const challengeXdr = buildChallengeTx(
+    const challengeXdr = WebAuth.buildChallengeTx(
       serverKeypair,
       account,
       homeDomain,
-      300,
+      CHALLENGE_TIMEOUT_SEC,
       network,
       homeDomain,
     );
